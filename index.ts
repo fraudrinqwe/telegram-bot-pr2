@@ -101,15 +101,14 @@ bot.command("my_profile", (ctx) => {
     return;
   }
   ctx.reply(
-    "📊 **Твій профіль:**\n\n"
+    `📊 Твій профіль:\n\n`
       + `Вік: ${profile.age}\n`
       + `Зріст: ${profile.height} см\n`
       + `Вага: ${profile.weight} кг\n`
       + `Стать: ${profile.sex === "male" ? "Чоловік" : "Жінка"}\n`
       + `Активність: ${activityLabels[profile.activity]}\n\n`
-      + `🔥 **BMR:** ${profile.bmr} ккал/день\n`
-      + `⚡ **TDEE:** ${profile.tdee} ккал/день`,
-    { parse_mode: "Markdown" }
+      + `🔥 BMR: ${profile.bmr} ккал/день\n`
+      + `⚡ TDEE: ${profile.tdee} ккал/день`
   );
 });
 
@@ -195,11 +194,10 @@ bot.on("message:text", (ctx) => {
         userStates.delete(id);
 
         ctx.reply(
-          "✅ **Профіль створено!**\n\n"
-            + `🔥 **BMR:** ${bmr} ккал/день — базовий обмін речовин\n`
-            + `⚡ **TDEE:** ${tdee} ккал/день — денна норма з урахуванням активності\n\n`
-            + `Щоб переглянути профіль, напиши /my_profile`,
-          { parse_mode: "Markdown" }
+          `✅ Профіль створено!\n\n`
+            + `🔥 BMR: ${bmr} ккал/день — базовий обмін речовин\n`
+            + `⚡ TDEE: ${tdee} ккал/день — денна норма з урахуванням активності\n\n`
+            + `Щоб переглянути профіль, напиши /my_profile`
         );
         break;
       }
