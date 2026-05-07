@@ -108,6 +108,12 @@ function getTodayMeals(userId: number) {
   }[];
 }
 
+const GEMINI_MODELS = [
+  "gemini-2.0-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+];
+
 async function estimateCalories(mealText: string): Promise<{
   items: { name: string; grams: number; calories: number }[];
   total_calories: number;
@@ -125,37 +131,41 @@ Break down into individual items, estimate grams and calories for each. Total ca
 
 Meal: "${mealText}"`;
 
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-      }),
-    });
+  for (const model of GEMINI_MODELS) {
+    try {
+      const apiVersion = model.includes("1.5") ? "v1" : "v1beta";
+      const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      });
 
-    const data = await res.json() as { candidates?: { content: { parts: { text: string }[] } }[] };
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+      const data = await res.json() as { candidates?: { content: { parts: { text: string }[] } }[] };
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
-    if (!text) {
-      console.error("Gemini: empty response", JSON.stringify(data));
-      return null;
+      if (!text) {
+        console.error(`Gemini [${model}]: empty response`, JSON.stringify(data));
+        continue;
+      }
+
+      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "");
+      const json = JSON.parse(cleaned);
+
+      if (!Array.isArray(json.items) || typeof json.total_calories !== "number" || typeof json.confidence !== "number") {
+        console.error(`Gemini [${model}]: invalid JSON structure`, json);
+        continue;
+      }
+
+      return json;
+    } catch (err) {
+      console.error(`Gemini [${model}]: error`, err);
     }
-
-    const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "");
-    const json = JSON.parse(cleaned);
-
-    if (!Array.isArray(json.items) || typeof json.total_calories !== "number" || typeof json.confidence !== "number") {
-      console.error("Gemini: invalid JSON structure", json);
-      return null;
-    }
-
-    return json;
-  } catch (err) {
-    console.error("Gemini: error", err);
-    return null;
   }
+
+  return null;
 }
 
 const userStates = new Map<number, { step: string; data: Record<string, unknown> }>();
