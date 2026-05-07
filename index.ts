@@ -179,7 +179,7 @@ bot.on("message:text", (ctx) => {
           return;
         }
         const data = state.data as Required<typeof state.data>;
-        const bmr = Math.round(calculateBmr(data.weight, data.height, data.age, data.sex));
+        const bmr = Math.round(calculateBMR(data.weight, data.height, data.age, data.sex));
         const tdee = calculateTDEE(bmr, activity);
 
         const profile: UserProfile = {
