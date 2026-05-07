@@ -1,4 +1,4 @@
-import { Bot } from "grammy";
+import { Bot, Keyboard } from "grammy";
 import { Database } from "bun:sqlite";
 
 const token = process.env.BOT_TOKEN;
@@ -22,9 +22,14 @@ db.run(`
     activity_level TEXT NOT NULL,
     bmr INTEGER NOT NULL,
     tdee INTEGER NOT NULL,
+    goal TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )
 `);
+
+try {
+  db.run(`ALTER TABLE users ADD COLUMN goal TEXT`);
+} catch {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS meals (
@@ -54,6 +59,18 @@ const activityLabels: Record<string, string> = {
   high: "Висока (6-7 тренувань/тиждень)",
 };
 
+const goalLabels: Record<string, string> = {
+  lose: "🔻 Схуднення",
+  maintain: "⚖️ Підтримка",
+  gain: "🔺 Набір маси",
+};
+
+const goalAdjustments: Record<string, number> = {
+  lose: -400,
+  maintain: 0,
+  gain: 300,
+};
+
 function calculateBMR(weight: number, height: number, age: number, sex: "male" | "female"): number {
   const base = 10 * weight + 6.25 * height - 5 * age;
   return sex === "male" ? base + 5 : base - 161;
@@ -63,23 +80,30 @@ function calculateTDEE(bmr: number, activity: "low" | "light" | "medium" | "high
   return Math.round(bmr * activityMap[activity]);
 }
 
-function getUser(telegramId: number) {
-  return db.query("SELECT * FROM users WHERE telegram_id = ?").get(telegramId) as {
-    telegram_id: number;
-    age: number;
-    weight: number;
-    height: number;
-    sex: string;
-    activity_level: string;
-    bmr: number;
-    tdee: number;
-  } | undefined;
+interface UserRow {
+  telegram_id: number;
+  age: number;
+  weight: number;
+  height: number;
+  sex: string;
+  activity_level: string;
+  bmr: number;
+  tdee: number;
+  goal: string | null;
 }
 
-function saveUser(telegramId: number, age: number, weight: number, height: number, sex: string, activity: string, bmr: number, tdee: number) {
+function getUser(telegramId: number) {
+  return db.query("SELECT * FROM users WHERE telegram_id = ?").get(telegramId) as UserRow | undefined;
+}
+
+function saveUser(
+  telegramId: number, age: number, weight: number, height: number,
+  sex: string, activity: string, bmr: number, tdee: number, goal: string | null
+) {
   db.run(
-    `INSERT OR REPLACE INTO users (telegram_id, age, weight, height, sex, activity_level, bmr, tdee) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [telegramId, age, weight, height, sex, activity, bmr, tdee]
+    `INSERT OR REPLACE INTO users (telegram_id, age, weight, height, sex, activity_level, bmr, tdee, goal)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [telegramId, age, weight, height, sex, activity, bmr, tdee, goal]
   );
 }
 
@@ -107,7 +131,6 @@ function getTodayMeals(userId: number) {
 const GEMINI_MODELS = [
   "gemini-2.0-flash-lite",
   "gemini-2.0-flash",
-  "gemini-1.5-flash",
 ];
 
 async function estimateCalories(mealText: string): Promise<{
@@ -129,21 +152,18 @@ Meal: "${mealText}"`;
 
   for (const model of GEMINI_MODELS) {
     try {
-      const apiVersion = model.includes("1.5") ? "v1" : "v1beta";
-      const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
       });
 
       const data = await res.json() as { candidates?: { content: { parts: { text: string }[] } }[] };
       const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
       if (!text) {
-        console.error(`Gemini [${model}]: empty response`, JSON.stringify(data));
+        console.error(`Gemini [${model}]: empty`, JSON.stringify(data));
         continue;
       }
 
@@ -151,7 +171,6 @@ Meal: "${mealText}"`;
       const json = JSON.parse(cleaned);
 
       if (!Array.isArray(json.items) || typeof json.total_calories !== "number" || typeof json.confidence !== "number") {
-        console.error(`Gemini [${model}]: invalid JSON structure`, json);
         continue;
       }
 
@@ -160,17 +179,49 @@ Meal: "${mealText}"`;
       console.error(`Gemini [${model}]: error`, err);
     }
   }
+  return null;
+}
 
+async function generateMealIdeas(goal: string, tdee: number): Promise<string | null> {
+  if (!GEMINI_API_KEY) return null;
+  const goalLabel = goalLabels[goal] || goal;
+  const prompt = `Give 3 simple meal ideas for a person with goal: ${goalLabel}, daily calorie target ~${tdee} kcal.
+Return ONLY valid JSON array of strings, no markdown:
+["meal 1", "meal 2", "meal 3"]`;
+
+  for (const model of GEMINI_MODELS) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      });
+      const data = await res.json() as { candidates?: { content: { parts: { text: string }[] } }[] };
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+      if (!text) continue;
+      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "");
+      const ideas = JSON.parse(cleaned);
+      if (Array.isArray(ideas) && ideas.length === 3) {
+        return ideas.map((s: string) => `• ${s}`).join("\n");
+      }
+    } catch {}
+  }
   return null;
 }
 
 const userStates = new Map<number, { step: string; data: Record<string, unknown> }>();
 
+const planKeyboard = new Keyboard()
+  .text("📋 Plan").row()
+  .text("/help");
+
 bot.command("start", (ctx) => {
   ctx.reply(
     "👋 Вітаю! Я бот для підрахунку калорій.\n\n"
-      + "Я можу розрахувати твій BMR та TDEE, «оцінювати калорії з їжі за допомогою AI.\n"
-      + "Напиши /help щоб побачити список команд."
+      + "Я можу розрахувати твій BMR та TDEE, оцінювати калорії з їжі.\n"
+      + "Напиши /help щоб побачити список команд.",
+    { reply_markup: { keyboard: planKeyboard.build(), resize_keyboard: true } }
   );
 });
 
@@ -179,10 +230,11 @@ bot.command("help", (ctx) => {
     "📋 Доступні команди:\n\n"
       + "/start — привітання\n"
       + "/help — список команд\n"
-      + "/set_profile — заповнити профіль та розрахувати калорії\n"
-      + "/my_profile — переглянути свій профіль\n"
+      + "/set_profile — заповнити профіль\n"
+      + "/my_profile — переглянути профіль\n"
+      + "/plan — рекомендована норма калорій\n"
       + "/add_meal — додати прийом їжі\n"
-      + "/today — подивитись що з'їли сьогодні\n"
+      + "/today — що з'їли сьогодні\n"
       + "/info — інформація про бота"
   );
 });
@@ -213,13 +265,15 @@ bot.command("my_profile", (ctx) => {
     ctx.reply("У тебе ще немає профілю. Використай /set_profile щоб створити.");
     return;
   }
+  const goalLine = user.goal ? `\n🎯 Ціль: ${goalLabels[user.goal] || user.goal}` : "\n🎯 Ціль: не вибрана";
   ctx.reply(
     `📊 Твій профіль:\n\n`
       + `Вік: ${user.age}\n`
       + `Зріст: ${user.height} см\n`
       + `Вага: ${user.weight} кг\n`
       + `Стать: ${user.sex === "male" ? "Чоловік" : "Жінка"}\n`
-      + `Активність: ${activityLabels[user.activity_level]}\n\n`
+      + `Активність: ${activityLabels[user.activity_level]}`
+      + goalLine + `\n\n`
       + `🔥 BMR: ${user.bmr} ккал/день\n`
       + `⚡ TDEE: ${user.tdee} ккал/день`
   );
@@ -243,22 +297,59 @@ bot.command("today", (ctx) => {
     ctx.reply("Спочатку створи профіль через /set_profile.");
     return;
   }
-
   const meals = getTodayMeals(id);
   if (meals.length === 0) {
     ctx.reply("Сьогодні ще немає записаних прийомів їжі.");
     return;
   }
-
   const total = meals.reduce((sum, m) => sum + m.calories_estimated, 0);
   const lines = meals.map((m, i) => {
     const time = m.timestamp.slice(11, 16);
     return `${i + 1}. ${m.raw_text} — ${Math.round(m.calories_estimated)} kcal 🕐 ${time}`;
   });
+  ctx.reply(`📅 Сьогодні ви з'їли:\n\n${lines.join("\n")}\n\nВсього: ${Math.round(total)} kcal`);
+});
 
-  ctx.reply(
-    `📅 Сьогодні ви з'їли:\n\n${lines.join("\n")}\n\nВсього: ${Math.round(total)} kcal`
-  );
+bot.command("plan", async (ctx) => {
+  const id = ctx.from.id;
+  const user = getUser(id);
+  if (!user) {
+    ctx.reply("Спочатку заповніть профіль через /set_profile.");
+    return;
+  }
+  if (!user.goal) {
+    ctx.reply("Оновіть профіль через /set_profile і виберіть вашу ціль.");
+    return;
+  }
+  const adjustment = goalAdjustments[user.goal] || 0;
+  const recommended = user.tdee + adjustment;
+  const goalLabel = goalLabels[user.goal] || user.goal;
+
+  const explanations: Record<string, string> = {
+    lose: "Це помірний дефіцит калорій для поступового зниження ваги.",
+    maintain: "Це ваша денна норма для підтримки поточної ваги.",
+    gain: "Це невеликий профіцит калорій для набору маси.",
+  };
+
+  let msg = `🎯 Ваша ціль: ${goalLabel}\n\n`
+    + `Рекомендована норма: ${recommended} kcal / день\n\n`
+    + `${explanations[user.goal] || ""}\n\n`
+    + `Це загальні рекомендації, а не медична порада.`;
+
+  if (GEMINI_API_KEY) {
+    ctx.reply("⏳ Генерую ідеї страв...");
+    const ideas = await generateMealIdeas(user.goal, recommended);
+    if (ideas) {
+      msg += `\n\nІдеї страв:\n${ideas}`;
+    }
+  }
+
+  ctx.reply(msg);
+});
+
+bot.hears("📋 Plan", async (ctx) => {
+  await ctx.reply("/plan");
+  await bot.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
 });
 
 bot.on("message:text", async (ctx) => {
@@ -325,43 +416,54 @@ bot.on("message:text", async (ctx) => {
           ctx.reply("❌ Введіть одне з: low, light, medium, high:");
           return;
         }
-        const data = state.data as { age: number; height: number; weight: number; sex: "male" | "female" };
+        state.data.activity = activity;
+        state.step = "waiting_goal";
+        ctx.reply(
+          "6️⃣ Яка ваша ціль?\n\n"
+            + "• lose — 🔻 Схуднення\n"
+            + "• maintain — ⚖️ Підтримка\n"
+            + "• gain — 🔺 Набір маси"
+        );
+        break;
+      }
+      case "waiting_goal": {
+        const goal = lower;
+        if (!["lose", "maintain", "gain"].includes(goal)) {
+          ctx.reply("❌ Введіть одне з: lose, maintain, gain:");
+          return;
+        }
+        const data = state.data as { age: number; height: number; weight: number; sex: "male" | "female"; activity: string };
         const bmr = Math.round(calculateBMR(data.weight, data.height, data.age, data.sex));
-        const tdee = calculateTDEE(bmr, activity as "low" | "light" | "medium" | "high");
+        const tdee = calculateTDEE(bmr, data.activity as "low" | "light" | "medium" | "high");
 
-        saveUser(id, data.age, data.weight, data.height, data.sex, activity, bmr, tdee);
+        saveUser(id, data.age, data.weight, data.height, data.sex, data.activity, bmr, tdee, goal);
         userStates.delete(id);
+
+        const adjustment = goalAdjustments[goal] || 0;
+        const recommended = tdee + adjustment;
 
         ctx.reply(
           `✅ Профіль створено!\n\n`
-            + `🔥 BMR: ${bmr} ккал/день — базовий обмін речовин\n`
-            + `⚡ TDEE: ${tdee} ккал/день — денна норма з урахуванням активності\n\n`
-            + `Щоб переглянути профіль, напиши /my_profile\n`
-            + `Щоб додати їжу, напиши /add_meal`
+            + `🔥 BMR: ${bmr} ккал/день\n`
+            + `⚡ TDEE: ${tdee} ккал/день\n`
+            + `🎯 Ціль: ${goalLabels[goal]}\n`
+            + `📊 Рекомендована норма: ${recommended} kcal/день\n\n`
+            + `Напиши /plan для деталей.\n`
+            + `Напиши /add_meal щоб додати їжу.`
         );
         break;
       }
       case "waiting_meal_text": {
         userStates.delete(id);
-
         ctx.reply("⏳ Аналізую їжу...");
-
         const result = await estimateCalories(text);
         if (!result) {
           saveMeal(id, text, 0, null, null);
-          ctx.reply(
-            "✅ Прийом їжі збережено.\n"
-            + "Не вдалося проаналізувати їжу. Спробуйте описати простіше."
-          );
+          ctx.reply("✅ Прийом їжі збережено.\nНе вдалося проаналізувати їжу. Спробуйте описати простіше.");
           break;
         }
-
         saveMeal(id, text, result.total_calories, JSON.stringify(result), null);
-
-        const items = result.items.map(
-          (i) => `• ${i.name} — ${Math.round(i.calories)} kcal (${i.grams}g)`
-        ).join("\n");
-
+        const items = result.items.map((i) => `• ${i.name} — ${Math.round(i.calories)} kcal (${i.grams}g)`).join("\n");
         ctx.reply(
           `🍽 Знайдено:\n\n${items}\n\n`
             + `Всього: ${Math.round(result.total_calories)} kcal\n`
@@ -384,12 +486,10 @@ bot.on("message:text", async (ctx) => {
     ctx.reply(greetings[Math.floor(Math.random() * greetings.length)]);
     return;
   }
-
   if (lower === "help") {
     ctx.reply("Спробуй команду /help (зі слешем) 😉");
     return;
   }
-
   ctx.reply(`Я отримав твоє повідомлення: ${text}`);
 });
 
