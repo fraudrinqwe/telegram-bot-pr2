@@ -1,6 +1,5 @@
 import { Bot } from "grammy";
 import { Database } from "bun:sqlite";
-import { GoogleGenAI } from "@google/genai";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -8,14 +7,13 @@ if (!token) {
   process.exit(1);
 }
 
-const geminiKey = process.env.GEMINI_API_KEY;
-if (!geminiKey) {
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
   console.error("GEMINI_API_KEY not set in .env");
   process.exit(1);
 }
 
 const db = new Database("bot.db", { create: true });
-const ai = new GoogleGenAI({ apiKey: geminiKey });
 const bot = new Bot(token);
 
 db.run(`
@@ -128,20 +126,34 @@ Break down into individual items, estimate grams and calories for each. Total ca
 Meal: "${mealText}"`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: prompt,
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
     });
 
-    const text = response.text?.trim() || "";
-    const json = JSON.parse(text.replace(/```json\n?/g, "").replace(/```\n?/g, ""));
+    const data = await res.json() as { candidates?: { content: { parts: { text: string }[] } }[] };
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+
+    if (!text) {
+      console.error("Gemini: empty response", JSON.stringify(data));
+      return null;
+    }
+
+    const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "");
+    const json = JSON.parse(cleaned);
 
     if (!Array.isArray(json.items) || typeof json.total_calories !== "number" || typeof json.confidence !== "number") {
+      console.error("Gemini: invalid JSON structure", json);
       return null;
     }
 
     return json;
-  } catch {
+  } catch (err) {
+    console.error("Gemini: error", err);
     return null;
   }
 }
@@ -243,7 +255,7 @@ bot.command("today", (ctx) => {
   );
 });
 
-bot.on("message:text", (ctx) => {
+bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   const lower = text.toLowerCase();
   const id = ctx.from.id;
@@ -328,29 +340,28 @@ bot.on("message:text", (ctx) => {
 
         ctx.reply("⏳ Аналізую їжу...");
 
-        estimateCalories(text).then((result) => {
-          if (!result) {
-            saveMeal(id, text, 0, null, null);
-            ctx.reply(
-              `✅ Прийом їжі збережено.\n`
-              + `Не вдалося проаналізувати їжу. Спробуйте описати простіше.`
-            );
-            return;
-          }
-
-          saveMeal(id, text, result.total_calories, JSON.stringify(result), null);
-
-          const items = result.items.map(
-            (i) => `• ${i.name} — ${Math.round(i.calories)} kcal (${i.grams}g)`
-          ).join("\n");
-
+        const result = await estimateCalories(text);
+        if (!result) {
+          saveMeal(id, text, 0, null, null);
           ctx.reply(
-            `🍽 Знайдено:\n\n${items}\n\n`
-              + `Всього: ${Math.round(result.total_calories)} kcal\n`
-              + `Confidence: ${result.confidence}\n\n`
-              + `Примітка: це орієнтовна оцінка калорій.`
+            "✅ Прийом їжі збережено.\n"
+            + "Не вдалося проаналізувати їжу. Спробуйте описати простіше."
           );
-        });
+          break;
+        }
+
+        saveMeal(id, text, result.total_calories, JSON.stringify(result), null);
+
+        const items = result.items.map(
+          (i) => `• ${i.name} — ${Math.round(i.calories)} kcal (${i.grams}g)`
+        ).join("\n");
+
+        ctx.reply(
+          `🍽 Знайдено:\n\n${items}\n\n`
+            + `Всього: ${Math.round(result.total_calories)} kcal\n`
+            + `Confidence: ${result.confidence}\n\n`
+            + `Примітка: це орієнтовна оцінка калорій.`
+        );
         break;
       }
     }
